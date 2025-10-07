@@ -1,4 +1,3 @@
-# Streamlit-MVP
 # ⚽ Football Scouting Dashboard
 
 An interactive Streamlit web app for analyzing player performance data from Wyscout or similar football datasets.
