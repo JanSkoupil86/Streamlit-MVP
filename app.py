@@ -1,3 +1,13 @@
+# --- Streamlit crash-safety block ---
+import streamlit as st, traceback
+try:
+    import sys, numpy, pandas
+except Exception as e:
+    st.error("Startup import failed:")
+    st.code(traceback.format_exc())
+    st.stop()
+# --- end of safety block ---
+
 # app.py — Football Scouting App (Comparison + Similarity) — CRASH-SAFE
 # Shows full traceback on the page if anything breaks.
 
