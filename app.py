@@ -1,17 +1,49 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
+import io
 from typing import List, Tuple
 
 st.set_page_config(page_title="Scouting App", layout="wide")
 
+# ------------------------
+# Data loading utilities
+# ------------------------
 @st.cache_data(show_spinner=False)
-def load_data(path: str) -> pd.DataFrame:
+def load_csv_from_bytes(data_bytes: bytes) -> pd.DataFrame:
+    return pd.read_csv(io.BytesIO(data_bytes), low_memory=False)
+
+@st.cache_data(show_spinner=False)
+def load_csv_from_path(path: str) -> pd.DataFrame:
     df = pd.read_csv(path, low_memory=False)
-    # Strip whitespace from column names
-    df.columns = [c.strip() for c in df.columns]
     return df
+
+def upload_csv_ui() -> pd.DataFrame | None:
+    """
+    Render a drag-and-drop CSV upload and return a DataFrame if provided.
+    UI mirrors: 'Upload your Football Data CSV' with drag&drop + 'Browse files'.
+    """
+    st.markdown("#### Upload your Football Data CSV")
+    uploaded = st.file_uploader(
+        "Drag and drop file here",
+        type=["csv"],
+        accept_multiple_files=False,
+        help="Limit 200MB per file • CSV",
+        label_visibility="visible",
+    )
+    if uploaded is not None:
+        # Read into memory so caching is stable regardless of the stream object
+        data_bytes = uploaded.getvalue()
+        try:
+            df = load_csv_from_bytes(data_bytes)
+        except Exception as e:
+            st.error(f"Failed to read CSV: {e}")
+            return None
+        # Clean column names
+        df.columns = [c.strip() for c in df.columns]
+        st.success(f"Loaded **{uploaded.name}** – {len(df):,} rows × {len(df.columns)} cols")
+        return df
+    return None
 
 @st.cache_data(show_spinner=False)
 def detect_schema(df: pd.DataFrame):
@@ -24,7 +56,7 @@ def detect_schema(df: pd.DataFrame):
     date_cols = []
     for c in df.columns:
         s = df[c]
-        if s.isna().all(): 
+        if s.isna().all():
             continue
         if pd.api.types.is_datetime64_any_dtype(s):
             date_cols.append(c)
@@ -82,18 +114,21 @@ def shortlist_filters_ui(df: pd.DataFrame, schema: dict) -> pd.DataFrame:
     # Age filter
     age_col = next((c for c in schema["age_cols"] if c in dff.columns), None)
     if age_col:
-        amin, amax = int(np.nanmin(pd.to_numeric(dff[age_col], errors="coerce"))), int(np.nanmax(pd.to_numeric(dff[age_col], errors="coerce")))
-        if amin < amax and amax - amin < 60:
-            lo, hi = st.sidebar.slider("Age range", min_value=amin, max_value=amax, value=(amin, amax))
+        amin = pd.to_numeric(dff[age_col], errors="coerce").min()
+        amax = pd.to_numeric(dff[age_col], errors="coerce").max()
+        if pd.notna(amin) and pd.notna(amax) and amin < amax and (amax - amin) < 60:
+            lo, hi = st.sidebar.slider("Age range", min_value=int(amin), max_value=int(amax), value=(int(amin), int(amax)))
             dff = dff[(pd.to_numeric(dff[age_col], errors="coerce") >= lo) & (pd.to_numeric(dff[age_col], errors="coerce") <= hi)]
 
     # Minutes threshold (if available)
     min_col = next((c for c in schema["minutes_cols"] if c in dff.columns), None)
     if min_col:
-        mmin, mmax = float(np.nanmin(pd.to_numeric(dff[min_col], errors="coerce"))), float(np.nanmax(pd.to_numeric(dff[min_col], errors="coerce")))
-        default_min = int(np.clip(mmax * 0.2, 0, mmax))  # default to 20% of max
-        thr = st.sidebar.number_input(f"Min minutes ({min_col})", min_value=0, max_value=int(mmax), value=int(default_min), step=10)
-        dff = dff[pd.to_numeric(dff[min_col], errors="coerce") >= thr]
+        mmin = pd.to_numeric(dff[min_col], errors="coerce").min()
+        mmax = pd.to_numeric(dff[min_col], errors="coerce").max()
+        if pd.notna(mmin) and pd.notna(mmax) and mmax > 0:
+            default_min = int(np.clip(mmax * 0.2, 0, mmax))  # default to 20% of max
+            thr = st.sidebar.number_input(f"Min minutes ({min_col})", min_value=0, max_value=int(mmax), value=int(default_min), step=10)
+            dff = dff[pd.to_numeric(dff[min_col], errors="coerce") >= thr]
 
     return dff
 
@@ -113,44 +148,49 @@ def percentile_shortlist_ui(df: pd.DataFrame, schema: dict) -> pd.DataFrame:
     p = st.sidebar.slider("Minimum percentile across selected metrics", min_value=50, max_value=99, value=80, step=1)
 
     # Compute row-wise min-percentile across selected metrics
-    # Convert to numeric safely
     dff = df.copy()
     for c in metrics:
         dff[c] = pd.to_numeric(dff[c], errors="coerce")
 
-    # Population for percentiles = current filtered set
     ref = dff[metrics].astype(float)
-
-    # per-column percentile ranks
     pr = ref.rank(pct=True).fillna(0.0)
-    # min across selected metrics (strict AND)
     dff["_min_pct"] = pr.min(axis=1) * 100.0
     out = dff[dff["_min_pct"] >= p].copy()
     return out
 
 def prettify(df: pd.DataFrame, schema: dict) -> Tuple[pd.DataFrame, List[str]]:
     # Choose display columns
-    # Try to put player/age/team/position first if present
     front = []
     for group in ["player_cols", "team_cols", "league_cols", "position_cols", "age_cols", "foot_cols"]:
         for c in schema[group]:
             if c in df.columns and c not in front:
                 front.append(c)
-    # Add a handful of numeric metrics
     numeric_sample = [c for c in schema["numeric"] if c in df.columns and c not in front][:10]
-    cols = front + numeric_sample
-    cols = [c for c in cols if c in df.columns]
-    # Avoid duplicate columns
-    cols = list(dict.fromkeys(cols))
+    cols = list(dict.fromkeys(front + numeric_sample))
     return df[cols], cols
 
 # ---- App ----
 st.title("🧭 Scouting App – Wyscout Export")
 
-# Data path input
-default_path = "Wyscout_League_Export-new.csv"
-path = st.sidebar.text_input("CSV path", value=default_path, help="Use the default if running in the provided workspace.")
-df = load_data(path)
+# Upload OR fallback to path
+uploaded_df = upload_csv_ui()
+
+with st.sidebar:
+    st.markdown("### Or load from path")
+    default_path = "Wyscout_League_Export-new.csv"
+    path = st.text_input("CSV path", value=default_path, help="If no file is uploaded, the app will try to load from this path.")
+
+if uploaded_df is not None:
+    df = uploaded_df
+else:
+    try:
+        df = load_csv_from_path(path)
+        df.columns = [c.strip() for c in df.columns]
+        st.info(f"Loaded from path **{path}** – {len(df):,} rows × {len(df.columns)} cols")
+    except Exception as e:
+        st.error(f"Could not load data. Upload a CSV above or fix the path. Error: {e}")
+        st.stop()
+
 schema = detect_schema(df)
 
 with st.expander("Detected schema (click to expand)"):
@@ -183,4 +223,4 @@ with tab2:
     st.download_button("Download shortlist CSV", data=view2.to_csv(index=False).encode("utf-8"), file_name="shortlist.csv", mime="text/csv")
 
 st.markdown("---")
-st.caption("Tip: Use the sidebar to set minutes threshold, pick leagues/positions, then choose metrics and a minimum percentile to generate a shortlist.")
+st.caption("Tip: Upload a CSV or use the path loader in the sidebar. Then set filters and percentile thresholds to generate a shortlist.")
