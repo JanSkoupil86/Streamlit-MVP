@@ -1,226 +1,331 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
 import io
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 
-st.set_page_config(page_title="Scouting App", layout="wide")
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
 
-# ------------------------
-# Data loading utilities
-# ------------------------
+st.set_page_config(page_title="Scouting App", layout="wide", page_icon="🧭")
+
+# =========================================================
+# Data loading & schema helpers
+# =========================================================
 @st.cache_data(show_spinner=False)
 def load_csv_from_bytes(data_bytes: bytes) -> pd.DataFrame:
     return pd.read_csv(io.BytesIO(data_bytes), low_memory=False)
 
 @st.cache_data(show_spinner=False)
 def load_csv_from_path(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path, low_memory=False)
-    return df
+    return pd.read_csv(path, low_memory=False)
 
 def upload_csv_ui() -> pd.DataFrame | None:
-    """
-    Render a drag-and-drop CSV upload and return a DataFrame if provided.
-    UI mirrors: 'Upload your Football Data CSV' with drag&drop + 'Browse files'.
-    """
     st.markdown("#### Upload your Football Data CSV")
-    uploaded = st.file_uploader(
+    up = st.file_uploader(
         "Drag and drop file here",
         type=["csv"],
         accept_multiple_files=False,
         help="Limit 200MB per file • CSV",
         label_visibility="visible",
     )
-    if uploaded is not None:
-        # Read into memory so caching is stable regardless of the stream object
-        data_bytes = uploaded.getvalue()
+    if up is not None:
+        data_bytes = up.getvalue()
         try:
             df = load_csv_from_bytes(data_bytes)
         except Exception as e:
             st.error(f"Failed to read CSV: {e}")
             return None
-        # Clean column names
         df.columns = [c.strip() for c in df.columns]
-        st.success(f"Loaded **{uploaded.name}** – {len(df):,} rows × {len(df.columns)} cols")
+        st.success(f"Loaded **{up.name}** – {len(df):,} rows × {len(df.columns)} cols")
         return df
     return None
 
 @st.cache_data(show_spinner=False)
-def detect_schema(df: pd.DataFrame):
-    # Heuristics to classify columns
+def detect_schema(df: pd.DataFrame) -> Dict[str, List[str]]:
     num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
     obj_cols = [c for c in df.columns if pd.api.types.is_object_dtype(df[c])]
-    # Categorical: low-cardinality object columns
     cat_cols = [c for c in obj_cols if df[c].nunique(dropna=True) <= max(50, len(df)//100)]
-    # Try to detect dates
-    date_cols = []
-    for c in df.columns:
-        s = df[c]
-        if s.isna().all():
-            continue
-        if pd.api.types.is_datetime64_any_dtype(s):
-            date_cols.append(c)
-            continue
-        # attempt parse on a small sample
-        sample = s.dropna().astype(str).head(50)
-        try:
-            pd.to_datetime(sample, errors="raise", utc=True, infer_datetime_format=True)
-            date_cols.append(c)
-        except Exception:
-            pass
-    # Try to identify name-ish/ID-ish columns
+
+    # Name-ish / entity-ish
     name_like = [c for c in df.columns if any(k in c.lower() for k in ["player", "name"])]
     team_like = [c for c in df.columns if any(k in c.lower() for k in ["team", "club"])]
     league_like = [c for c in df.columns if any(k in c.lower() for k in ["league", "competition"])]
     position_like = [c for c in df.columns if "position" in c.lower()]
-    foot_like = [c for c in df.columns if "foot" in c.lower()]
     minutes_like = [c for c in df.columns if any(k in c.lower() for k in ["minutes", "mins", "min played", "90s"])]
-    age_like = [c for c in df.columns if "age" in c.lower()]
+
     return {
         "numeric": num_cols,
         "categorical": cat_cols,
-        "dates": date_cols,
-        "player_cols": name_like,
+        "player_cols": name_like or obj_cols[:1],
         "team_cols": team_like,
         "league_cols": league_like,
         "position_cols": position_like,
-        "foot_cols": foot_like,
         "minutes_cols": minutes_like,
-        "age_cols": age_like,
     }
 
-def shortlist_filters_ui(df: pd.DataFrame, schema: dict) -> pd.DataFrame:
-    st.sidebar.header("Filters")
-    dff = df.copy()
+def get_primary_col(df: pd.DataFrame, candidates: List[str]) -> str | None:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
 
-    # Basic entity filters (only render if present)
-    def multi_filter(col_candidates: List[str], label: str):
-        for c in col_candidates:
-            if c in dff.columns:
-                values = sorted([v for v in dff[c].dropna().unique().tolist() if v != ""])
-                if len(values) and len(values) <= 200:
-                    sel = st.sidebar.multiselect(label, values, default=[])
-                    if sel:
-                        return dff[dff[c].isin(sel)]
-                return dff
+# =========================================================
+# Radar helpers
+# =========================================================
+def per90_transform(dff: pd.DataFrame, metrics: List[str], minutes_col: str | None) -> pd.DataFrame:
+    """Convert selected metrics to per90 using minutes_col when available."""
+    if not minutes_col or minutes_col not in dff.columns:
         return dff
-
-    dff = multi_filter(schema["league_cols"], "League")
-    dff = multi_filter(schema["team_cols"], "Team/Club")
-    dff = multi_filter(schema["position_cols"], "Position")
-    dff = multi_filter(schema["foot_cols"], "Preferred Foot")
-    dff = multi_filter(schema["categorical"], "Other category")
-
-    # Age filter
-    age_col = next((c for c in schema["age_cols"] if c in dff.columns), None)
-    if age_col:
-        amin = pd.to_numeric(dff[age_col], errors="coerce").min()
-        amax = pd.to_numeric(dff[age_col], errors="coerce").max()
-        if pd.notna(amin) and pd.notna(amax) and amin < amax and (amax - amin) < 60:
-            lo, hi = st.sidebar.slider("Age range", min_value=int(amin), max_value=int(amax), value=(int(amin), int(amax)))
-            dff = dff[(pd.to_numeric(dff[age_col], errors="coerce") >= lo) & (pd.to_numeric(dff[age_col], errors="coerce") <= hi)]
-
-    # Minutes threshold (if available)
-    min_col = next((c for c in schema["minutes_cols"] if c in dff.columns), None)
-    if min_col:
-        mmin = pd.to_numeric(dff[min_col], errors="coerce").min()
-        mmax = pd.to_numeric(dff[min_col], errors="coerce").max()
-        if pd.notna(mmin) and pd.notna(mmax) and mmax > 0:
-            default_min = int(np.clip(mmax * 0.2, 0, mmax))  # default to 20% of max
-            thr = st.sidebar.number_input(f"Min minutes ({min_col})", min_value=0, max_value=int(mmax), value=int(default_min), step=10)
-            dff = dff[pd.to_numeric(dff[min_col], errors="coerce") >= thr]
-
-    return dff
-
-def percentile_shortlist_ui(df: pd.DataFrame, schema: dict) -> pd.DataFrame:
-    st.sidebar.header("Percentile Shortlist")
-    num_cols = [c for c in schema["numeric"] if c in df.columns]
-    if not num_cols:
-        st.info("No numeric columns detected for percentile filtering.")
-        return df
-
-    # Choose metrics
-    metrics = st.sidebar.multiselect("Metrics (choose 1–5)", num_cols[:200], default=num_cols[:2], max_selections=5)
-    if not metrics:
-        return df
-
-    # Percentile threshold
-    p = st.sidebar.slider("Minimum percentile across selected metrics", min_value=50, max_value=99, value=80, step=1)
-
-    # Compute row-wise min-percentile across selected metrics
-    dff = df.copy()
+    out = dff.copy()
+    m = pd.to_numeric(out[minutes_col], errors="coerce")
+    m = m.replace(0, np.nan)  # avoid divide by zero
     for c in metrics:
-        dff[c] = pd.to_numeric(dff[c], errors="coerce")
-
-    ref = dff[metrics].astype(float)
-    pr = ref.rank(pct=True).fillna(0.0)
-    dff["_min_pct"] = pr.min(axis=1) * 100.0
-    out = dff[dff["_min_pct"] >= p].copy()
+        if c not in out.columns:
+            continue
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+        out[c] = (out[c] / m) * 90.0
     return out
 
-def prettify(df: pd.DataFrame, schema: dict) -> Tuple[pd.DataFrame, List[str]]:
-    # Choose display columns
-    front = []
-    for group in ["player_cols", "team_cols", "league_cols", "position_cols", "age_cols", "foot_cols"]:
-        for c in schema[group]:
-            if c in df.columns and c not in front:
-                front.append(c)
-    numeric_sample = [c for c in schema["numeric"] if c in df.columns and c not in front][:10]
-    cols = list(dict.fromkeys(front + numeric_sample))
-    return df[cols], cols
+def normalize_0_100(dff: pd.DataFrame, metrics: List[str]) -> pd.DataFrame:
+    """Column-wise min-max to [0,100]. If col has zero variance, set 50."""
+    out = dff.copy()
+    for c in metrics:
+        col = pd.to_numeric(out[c], errors="coerce")
+        lo, hi = np.nanmin(col), np.nanmax(col)
+        if not np.isfinite(lo) or not np.isfinite(hi):
+            out[c] = np.nan
+        elif hi - lo == 0:
+            out[c] = 50.0
+        else:
+            out[c] = (col - lo) / (hi - lo) * 100.0
+    return out
 
-# ---- App ----
-st.title("🧭 Scouting App – Wyscout Export")
+def radar_figure(series_dict: Dict[str, pd.Series],
+                 title: str,
+                 fill: bool,
+                 colors: Dict[str, str] | None = None) -> go.Figure:
+    """Build a Plotly polar radar chart from a dict of player_name -> metrics series."""
+    metrics = series_dict[next(iter(series_dict))].index.tolist()
+    fig = go.Figure()
+    for player, s in series_dict.items():
+        vals = s.fillna(0).tolist()
+        # close loop
+        r = vals + [vals[0]]
+        theta = metrics + [metrics[0]]
+        line_color = (colors or {}).get(player, None)
+        fig.add_trace(
+            go.Scatterpolar(
+                r=r, theta=theta, name=player,
+                mode="lines+markers",
+                fill="toself" if fill else None,
+                line=dict(width=2, color=line_color) if line_color else dict(width=2),
+            )
+        )
+    fig.update_layout(
+        title=title,
+        polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
+        showlegend=True,
+        margin=dict(l=10, r=10, t=60, b=10),
+        height=650,
+    )
+    return fig
 
-# Upload OR fallback to path
-uploaded_df = upload_csv_ui()
+# =========================================================
+# UI bits
+# =========================================================
+def sidebar_nav() -> str:
+    st.sidebar.markdown("## ☰ Menu")
+    page = st.sidebar.radio(
+        label="Navigate",
+        options=[
+            "Home",
+            "Stats Dashboard",
+            "Player Comparison",
+            "Player Scout Report",
+            "Player Clone",
+            "Player Profiler",
+            "Player Performance",
+            "Player Screener",
+            "Help",
+        ],
+        index=2,  # land on Player Comparison by default
+        label_visibility="collapsed",
+    )
+    st.sidebar.markdown("---")
+    return page
 
-with st.sidebar:
-    st.markdown("### Or load from path")
-    default_path = "Wyscout_League_Export-new.csv"
-    path = st.text_input("CSV path", value=default_path, help="If no file is uploaded, the app will try to load from this path.")
+def stat_categories_from_columns(num_cols: List[str]) -> Dict[str, List[str]]:
+    """Very light heuristic buckets based on common keywords."""
+    def pick(*keys):
+        keys_low = [k.lower() for k in keys]
+        return [c for c in num_cols if any(k in c.lower() for k in keys_low)]
 
-if uploaded_df is not None:
-    df = uploaded_df
-else:
-    try:
-        df = load_csv_from_path(path)
-        df.columns = [c.strip() for c in df.columns]
-        st.info(f"Loaded from path **{path}** – {len(df):,} rows × {len(df.columns)} cols")
-    except Exception as e:
-        st.error(f"Could not load data. Upload a CSV above or fix the path. Error: {e}")
-        st.stop()
+    return {
+        "Comprehensive": num_cols[:20],  # first 20 numeric by order
+        "Shooting": pick("shot", "xg", "npxg", "goals", "sca", "gca"),
+        "Passing": pick("pass", "key pass", "assist", "xA", "cross", "prog pass"),
+        "Possession/Progression": pick("carry", "progress", "dribble", "touch"),
+        "Defending": pick("tackle", "interception", "clearance", "block", "press", "aerial", "duel"),
+        "Goalkeeping": pick("save", "keeper", "ga", "psxg"),
+    }
 
-schema = detect_schema(df)
+# =========================================================
+# Pages
+# =========================================================
+def page_home(df, schema):
+    st.title("🏠 Home")
+    st.write("Welcome to the Scouting App. Use the left menu to explore your data.")
+    st.write(f"Loaded dataset: **{len(df):,} rows × {len(df.columns)} cols**")
+    with st.expander("Detected schema"):
+        st.json(schema)
 
-with st.expander("Detected schema (click to expand)"):
-    st.json(schema)
+def page_player_comparison(df: pd.DataFrame, schema: Dict[str, List[str]]):
+    st.title("⚖️ Player Comparison")
+    st.caption("Compare two or more players on a radar chart.")
 
-# Filters
-filtered = shortlist_filters_ui(df, schema)
+    # --- Top controls like your screenshot ---
+    st.toggle("Search for Players", value=True, key="search_toggle", help="Enable type-to-search in the player selector.")
+    player_col = get_primary_col(df, schema["player_cols"])
+    if not player_col:
+        st.warning("Couldn't find a player name column. Please ensure your CSV has a 'Player' or 'Name' column.")
+        return
 
-# Percentile shortlist on the filtered set
-shortlisted = percentile_shortlist_ui(filtered, schema)
+    # Player multi-select (searchable)
+    players_all = sorted([p for p in df[player_col].dropna().unique().tolist() if str(p).strip() != ""])
+    default_players = players_all[:2] if len(players_all) >= 2 else players_all
+    selected_players = st.multiselect("🌐 Select Players:", options=players_all, default=default_players)
 
-# Display
-tab1, tab2 = st.tabs(["Filtered dataset", "Shortlist"])
+    # Color customization
+    with st.expander("🎨 Customize Player Colors", expanded=False):
+        chosen_colors: Dict[str, str] = {}
+        for p in selected_players:
+            chosen_colors[p] = st.color_picker(f"Color for {p}", value="#1f77b4")
 
-with tab1:
-    view1, cols1 = prettify(filtered, schema)
-    st.caption(f"{len(view1):,} rows after filters")
-    st.dataframe(view1, use_container_width=True, hide_index=True)
-    st.download_button("Download filtered CSV", data=view1.to_csv(index=False).encode("utf-8"), file_name="filtered.csv", mime="text/csv")
+    # Stat categories
+    num_cols = [c for c in schema["numeric"] if c in df.columns]
+    categories = stat_categories_from_columns(num_cols)
+    cat_names = list(categories.keys())
+    cat_name = st.selectbox("📂 Select a Stat Category:", options=cat_names, index=0)
+    metrics_default = categories.get(cat_name, []) or num_cols[:12]
 
-with tab2:
-    if "_min_pct" in shortlisted.columns:
-        view2, cols2 = prettify(shortlisted, schema)
-        view2 = view2.copy()
-        view2.insert(0, "Min %ile (across chosen metrics)", shortlisted["_min_pct"].round(1).values)
+    # Filter Stats (choose axes)
+    with st.expander("🔎 Filter Stats", expanded=False):
+        metrics = st.multiselect(
+            "Pick metrics to plot (3–18 recommended):",
+            options=num_cols,
+            default=metrics_default[:12],
+        )
+
+    # Options row
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        do_norm = st.checkbox("✅ Normalize Values", value=True, help="Scale each metric to a 0–100 range across the selected dataset.")
+    with c2:
+        do_per90 = st.checkbox("✅ Per 90 Minutes", value=False, help="Convert selected metrics to per 90 using the minutes column if available.")
+    with c3:
+        do_fill = st.checkbox("✅ Enable Fill Color", value=True, help="Fill the area under each player's radar.")
+
+    if len(selected_players) < 1 or len(metrics) < 3:
+        st.info("Select at least one player and 3+ metrics to render a radar chart.")
+        return
+
+    # --- Build working frame restricted to selected players ---
+    dff = df.copy()
+    # Only keep needed columns for speed/clarity
+    keep_cols = [player_col] + metrics + schema.get("minutes_cols", [])
+    keep_cols = [c for c in keep_cols if c in dff.columns]
+    dff = dff[keep_cols]
+    dff = dff[dff[player_col].isin(selected_players)]
+
+    # Per 90 conversion if required
+    min_col = get_primary_col(dff, schema.get("minutes_cols", []))
+    if do_per90:
+        dff = per90_transform(dff, metrics, min_col)
+
+    # Normalize if required (on CURRENT subset only)
+    if do_norm:
+        dff = normalize_0_100(dff, metrics)
     else:
-        view2, cols2 = prettify(shortlisted, schema)
-    st.caption(f"{len(view2):,} players meet the percentile threshold")
-    st.dataframe(view2, use_container_width=True, hide_index=True)
-    st.download_button("Download shortlist CSV", data=view2.to_csv(index=False).encode("utf-8"), file_name="shortlist.csv", mime="text/csv")
+        # attempt to coerce numeric
+        for c in metrics:
+            dff[c] = pd.to_numeric(dff[c], errors="coerce")
 
-st.markdown("---")
-st.caption("Tip: Upload a CSV or use the path loader in the sidebar. Then set filters and percentile thresholds to generate a shortlist.")
+    # Aggregate per player (if duplicates exist across seasons/teams)
+    agg = dff.groupby(player_col, dropna=True)[metrics].mean(numeric_only=True)
+
+    # Missing values → 0 for visualization, warn the user
+    na_counts = agg.isna().sum(axis=1)
+    has_na = int(na_counts.sum())
+    if has_na:
+        st.warning(f"Missing values were found in the player stats and have been replaced with 0 for visualization. ({has_na} missing metric values total across selected players)")
+
+    # Prepare data for radar
+    series_dict = {p: agg.loc[p].fillna(0) for p in agg.index}
+    # If not normalized, bring radial axis to reasonable range
+    radial_title = f"Player Comparison - {cat_name}"
+    fig = radar_figure(series_dict, radial_title, fill=do_fill, colors=chosen_colors)
+
+    st.plotly_chart(fig, use_container_width=True, theme="streamlit")
+
+    # Download chart (PNG) using Plotly + kaleido
+    try:
+        import plotly.io as pio
+        png_bytes = pio.to_image(fig, format="png", scale=2)
+        st.download_button("⬇️ Download Chart", data=png_bytes, file_name="player_comparison.png", mime="image/png")
+    except Exception:
+        st.info("Install `kaleido` to enable PNG download: `pip install -U kaleido`")
+
+def page_placeholder(title: str):
+    st.title(title)
+    st.info("This page is a placeholder. We can wire it up next.")
+
+# =========================================================
+# App bootstrap
+# =========================================================
+def main():
+    # Upload OR load from path (sidebar)
+    uploaded_df = upload_csv_ui()
+
+    with st.sidebar:
+        st.markdown("### Or load from path")
+        default_path = "Wyscout_League_Export-new.csv"
+        path = st.text_input("CSV path", value=default_path, help="If no file is uploaded, the app will try to load from this path.")
+
+    if uploaded_df is not None:
+        df = uploaded_df
+    else:
+        try:
+            df = load_csv_from_path(path)
+            df.columns = [c.strip() for c in df.columns]
+            st.info(f"Loaded from path **{path}** – {len(df):,} rows × {len(df.columns)} cols")
+        except Exception as e:
+            st.error(f"Could not load data. Upload a CSV above or fix the path. Error: {e}")
+            st.stop()
+
+    schema = detect_schema(df)
+    page = sidebar_nav()
+
+    if page == "Home":
+        page_home(df, schema)
+    elif page == "Stats Dashboard":
+        page_placeholder("📊 Stats Dashboard")
+    elif page == "Player Comparison":
+        page_player_comparison(df, schema)
+    elif page == "Player Scout Report":
+        page_placeholder("🕵️ Player Scout Report")
+    elif page == "Player Clone":
+        page_placeholder("🧬 Player Clone")
+    elif page == "Player Profiler":
+        page_placeholder("🧠 Player Profiler")
+    elif page == "Player Performance":
+        page_placeholder("📈 Player Performance")
+    elif page == "Player Screener":
+        page_placeholder("🧪 Player Screener")
+    else:
+        page_placeholder("❓ Help")
+
+    st.markdown("---")
+    st.caption("Tip: Use the sidebar menu to navigate. The Player Comparison page supports colors, categories, per-90, normalization, and PNG downloads.")
+
+if __name__ == "__main__":
+    main()
